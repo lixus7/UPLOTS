@@ -1,5 +1,10 @@
 # UPLOTS
 
+Preprocess the raw dataset in the foulder   '/UPLOTS/Data/datasets/':
+
+ - data_etth.ipynb
+ - data energy.ipynb
+ - pems0408.ipynb
 
 run our work in UPLOTS:
 
