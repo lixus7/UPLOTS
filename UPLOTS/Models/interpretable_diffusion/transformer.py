@@ -7,12 +7,11 @@ from torch import nn
 from einops import rearrange, reduce, repeat
 from Models.interpretable_diffusion.model_utils import LearnablePositionalEncoding, Conv_MLP,\
                                                        AdaLayerNorm, Transpose, GELU2, series_decomp
-from transformers.models.gpt2.modeling_gpt2 import GPT2Model
-from transformers import BertTokenizer, BertModel
 from einops import rearrange
-# from embed import DataEmbedding, DataEmbedding_wo_time
-from transformers.models.gpt2.configuration_gpt2 import GPT2Config
-from Models.interpretable_diffusion.unitimegpt2 import UniTimeGPT2
+from Models.interpretable_diffusion.language_backbone import (
+    hidden_states_from_output,
+    load_language_backbone,
+)
 
 class TrendBlock(nn.Module):
     """
@@ -37,7 +36,7 @@ class TrendBlock(nn.Module):
         trend_vals = torch.matmul(x.transpose(1, 2), self.poly_space.to(x.device))
         trend_vals = trend_vals.transpose(1, 2)
         return trend_vals
-    
+
 
 class MovingBlock(nn.Module):
     """
@@ -100,7 +99,7 @@ class FourierLayer(nn.Module):
         index_tuple = (mesh_a.unsqueeze(1), indices, mesh_b.unsqueeze(1))
         x_freq = x_freq[index_tuple]
         return x_freq, index_tuple
-    
+
 
 class SeasonBlock(nn.Module):
     """
@@ -178,7 +177,7 @@ class CrossAttention(nn.Module):
         self.key = nn.Linear(condition_embd, n_embd)
         self.query = nn.Linear(n_embd, n_embd)
         self.value = nn.Linear(condition_embd, n_embd)
-        
+
         # regularization
         self.attn_drop = nn.Dropout(attn_pdrop)
         self.resid_drop = nn.Dropout(resid_pdrop)
@@ -204,7 +203,7 @@ class CrossAttention(nn.Module):
         # output projection
         y = self.resid_drop(self.proj(y))
         return y, att
-    
+
 
 class EncoderBlock(nn.Module):
     """ an unassuming Transformer block """
@@ -226,7 +225,7 @@ class EncoderBlock(nn.Module):
                 attn_pdrop=attn_pdrop,
                 resid_pdrop=resid_pdrop,
             )
-        
+
         assert activate in ['GELU', 'GELU2']
         act = nn.GELU() if activate == 'GELU' else GELU2()
 
@@ -236,7 +235,7 @@ class EncoderBlock(nn.Module):
                 nn.Linear(mlp_hidden_times * n_embd, n_embd),
                 nn.Dropout(resid_pdrop),
             )
-        
+
     def forward(self, x, timestep, mask=None, label_emb=None):
         a, att = self.attn(self.ln1(x, timestep, label_emb), mask=mask)
         x = x + a
@@ -287,14 +286,14 @@ class DecoderBlock(nn.Module):
                  condition_dim=1024,
                  ):
         super().__init__()
-        
+
         self.ln1 = AdaLayerNorm(n_embd)
         self.ln2 = nn.LayerNorm(n_embd)
 
         self.attn1 = FullAttention(
                 n_embd=n_embd,
                 n_head=n_head,
-                attn_pdrop=attn_pdrop, 
+                attn_pdrop=attn_pdrop,
                 resid_pdrop=resid_pdrop,
                 )
         self.attn2 = CrossAttention(
@@ -304,7 +303,7 @@ class DecoderBlock(nn.Module):
                 attn_pdrop=attn_pdrop,
                 resid_pdrop=resid_pdrop,
                 )
-        
+
         self.ln1_1 = AdaLayerNorm(n_embd)
 
         assert activate in ['GELU', 'GELU2']
@@ -335,7 +334,7 @@ class DecoderBlock(nn.Module):
         x = x + self.mlp(self.ln2(x))
         m = torch.mean(x, dim=1, keepdim=True)
         return x - m, self.linear(m), trend, season
-    
+
 
 class Decoder(nn.Module):
     def __init__(
@@ -349,7 +348,7 @@ class Decoder(nn.Module):
         resid_pdrop=0.1,
         mlp_hidden_times=4,
         block_activate='GELU',
-        condition_dim=512    
+        condition_dim=512
     ):
       super().__init__()
       self.d_model = n_embd
@@ -365,7 +364,7 @@ class Decoder(nn.Module):
                 activate=block_activate,
                 condition_dim=condition_dim,
         ) for _ in range(n_layer)])
-      
+
     def forward(self, x, t, enc, padding_masks=None, label_emb=None):
         b, c, _ = x.shape
         # att_weights = []
@@ -381,10 +380,8 @@ class Decoder(nn.Module):
 
         mean = torch.cat(mean, dim=1)
         return x, mean, trend, season
-    
 
 
-from transformers import GPT2Tokenizer
 
 class Transformer(nn.Module):
     def __init__(
@@ -401,10 +398,27 @@ class Transformer(nn.Module):
         block_activate='GELU',
         max_len=2048,
         conv_params=None,
+        backbone='gpt2',
+        backbone_name=None,
+        backbone_layers=None,
+        backbone_init='pretrained',
+        prompt_mode='text',
+        num_prompt_ids=1,
+        train_backbone=False,
         **kwargs
     ):
         super().__init__()
-        llm_dmodel = 768
+        language_model, tokenizer, llm_dmodel, resolved_name, resolved_layers = (
+            load_language_backbone(
+                backbone=backbone,
+                model_name=backbone_name,
+                num_layers=backbone_layers,
+                backbone_init=backbone_init,
+                prompt_mode=prompt_mode,
+                train_backbone=train_backbone,
+            )
+        )
+        self.llm_dmodel = llm_dmodel
         self.emb = Conv_MLP(n_feat, llm_dmodel, resid_pdrop=resid_pdrop)
         self.binary_indicator_embedding = nn.Linear(n_feat, llm_dmodel)
         self.gate_w1 = nn.Linear(llm_dmodel, llm_dmodel)
@@ -413,7 +427,7 @@ class Transformer(nn.Module):
         self.feature_projection = nn.Linear(llm_dmodel, llm_dmodel)
         self.ts_embed_dropout = nn.Dropout(0.3)
         self.n_channel = n_channel
-        
+
         self.inverse = Conv_MLP(n_embd, n_feat, resid_pdrop=resid_pdrop)
 
         if conv_params is None or conv_params[0] is None:
@@ -435,52 +449,71 @@ class Transformer(nn.Module):
         self.decoder = Decoder(n_channel, n_feat, n_embd, n_heads, n_layer_dec, attn_pdrop, resid_pdrop, mlp_hidden_times,
                                block_activate, condition_dim=n_embd)
         self.pos_dec = LearnablePositionalEncoding(n_embd, dropout=resid_pdrop, max_len=max_len)
-        
-        
-        self.tokenizer = GPT2Tokenizer.from_pretrained('gpt2')
-        self.gpt2_tr = UniTimeGPT2.from_pretrained('gpt2')
-        self.gpt2_tr.transformer.h = self.gpt2_tr.transformer.h[:2]
+
+
+        self.backbone = str(backbone).lower()
+        self.backbone_name = resolved_name
+        self.backbone_layers = resolved_layers
+        self.backbone_init = backbone_init
+        self.prompt_mode = prompt_mode
+        self.max_token_num = 17
+        self.tokenizer = tokenizer
+
+        # Keep this legacy attribute name so existing GPT-2 checkpoints retain
+        # their state-dict keys.  It may now contain either GPT-2 or LLaMA.
+        self.gpt2_tr = language_model
+
+        if prompt_mode == 'learned_id':
+            self.prompt_embedding = nn.Embedding(num_prompt_ids, llm_dmodel)
 
         # self.gpt2.h = self.gpt2.h[:2] # gpt_layer = 6
-        
-        pretrain = 1
-        freeze = 1
-        self.max_token_num = 17
-        self.gpt_out = nn.Linear(llm_dmodel, n_embd) 
-        self.gpt_out2 = nn.Linear(n_channel+self.max_token_num, n_channel) 
+
+        self.gpt_out = nn.Linear(llm_dmodel, n_embd)
+        self.gpt_out2 = nn.Linear(n_channel+self.max_token_num, n_channel)
         self.pad_token = nn.Parameter(torch.randn(1, 1, llm_dmodel), requires_grad=True)
-#         self.gpt2_4_trend = GPT2Model.from_pretrained('gpt2-small', output_attentions=True, output_hidden_states=True) 
+#         self.gpt2_4_trend = GPT2Model.from_pretrained('gpt2-small', output_attentions=True, output_hidden_states=True)
 #         self.gpt2_4_trend.h = self.gpt2_4_trend.h[:2] # gpt_layer = 6
-        if freeze and pretrain:
-            for i, (name, param) in enumerate(self.gpt2_tr.named_parameters()):
-                if 'ln' in name or 'wpe' in name:
-                    param.requires_grad = True
-                else:
-                    param.requires_grad = False        
-      
-        
-#         self.gpt2_4_sea = GPT2Model.from_pretrained('gpt2', output_attentions=True, output_hidden_states=True) 
+#         self.gpt2_4_sea = GPT2Model.from_pretrained('gpt2', output_attentions=True, output_hidden_states=True)
 #         self.gpt2_4_sea.h = self.gpt2_4_sea.h[:1] # gpt_layer = 6
 #         if freeze and pretrain:
 #             for i, (name, param) in enumerate(self.gpt2_4_sea.named_parameters()):
 #                 if 'ln' in name or 'wpe' in name:
 #                     param.requires_grad = True
 #                 else:
-#                     param.requires_grad = False        
-     
+#                     param.requires_grad = False
+
+
+    def _prompt_embeddings(self, instruct, batch_size, device):
+        if self.prompt_mode == 'none':
+            return torch.empty(batch_size, 0, self.llm_dmodel, device=device)
+
+        if self.prompt_mode == 'learned_id':
+            prompt_id = int(instruct.item()) if torch.is_tensor(instruct) else int(instruct)
+            prompt_ids = torch.tensor([prompt_id], dtype=torch.long, device=device)
+            return self.prompt_embedding(prompt_ids).unsqueeze(0).repeat(batch_size, 1, 1)
+
+        instruct_ids = self.tokenizer(
+            str(instruct),
+            return_tensors='pt',
+            add_special_tokens=False,
+            truncation=True,
+            max_length=self.max_token_num,
+        ).input_ids.to(device)
+        token_embeddings = self.gpt2_tr.get_input_embeddings()(instruct_ids)
+        return token_embeddings.repeat(batch_size, 1, 1)
 
     def forward(self, instruct, input, t, mask = None, padding_masks=None, return_res=False):
         # print(' t is ', t) # [32, 24, 7]
         # print('input ',input.shape)
         b,tt,n = input.size()
-        
-        if mask==None:
+
+        if mask is None:
             # print('mask none')
             mask = torch.ones((b, tt, n)).to(input.device)
         # print('mask shape is: ',mask.shape)    # b,tt,n
-        # torch.sum(mask == 1, dim=1)   
+        # torch.sum(mask == 1, dim=1)
         # torch.sum(input, dim=1)
-        # means = torch.sum(input, dim=1) / torch.sum(mask == 1, dim=1)    
+        # means = torch.sum(input, dim=1) / torch.sum(mask == 1, dim=1)
         # means = means.unsqueeze(1).detach()
         # input -= means
         # input = input.masked_fill(mask == 0, 0)
@@ -488,59 +521,59 @@ class Transformer(nn.Module):
         #                    torch.sum(mask == 1, dim=1) + 1e-5)
         # stdev = stdev.unsqueeze(1).detach()
         # input /= stdev
-        
-        
-        
+
+
+
         emb = self.emb(input)
-         
-        
+
+
         # if mask!=None:
-        
+
         #     mask_embed = self.binary_indicator_embedding(mask)
         #     gate = self.gate_sigmoid(self.gate_w1(emb) + self.gate_w2(mask_embed))
         #     emb = gate * emb + (1 - gate) * mask_embed
-        #     emb = self.feature_projection(emb)            
+        #     emb = self.feature_projection(emb)
         #     emb = self.ts_embed_dropout(emb)
-        #  print(' emb shape is ', emb.shape) # [32, 24, 768]     
-        
-        instruct_ids = self.tokenizer(instruct, return_tensors='pt').input_ids.to(input.device)
-        instruct_embed = self.gpt2_tr.transformer.wte(instruct_ids).repeat(emb.shape[0], 1, 1)  #  [32, 9, 768] 
-        # print('instruct_embed shape is ',instruct_embed.shape) # [32, 9, 768] 
+        #  print(' emb shape is ', emb.shape) # [32, 24, 768]
+
+        instruct_embed = self._prompt_embeddings(instruct, emb.shape[0], input.device)
+        # print('instruct_embed shape is ',instruct_embed.shape) # [32, 9, 768]
         inputs_embeds = torch.cat((instruct_embed, emb), dim=1)
-        # print('inputs_embeds add emb shape is ',inputs_embeds.shape)  # [32, 24+9, 768] 
+        # print('inputs_embeds add emb shape is ',inputs_embeds.shape)  # [32, 24+9, 768]
 #         # (2) to do : modify emb part to the unitime encoder+token+instruction part.
-        
-        
-        
-        
-        
-        emb_out = self.gpt2_tr(inputs_embeds=inputs_embeds)
+
+
+
+
+
+        backbone_output = self.gpt2_tr(inputs_embeds=inputs_embeds, use_cache=False)
+        emb_out = hidden_states_from_output(backbone_output)
         b, token_num, _ = emb_out.shape
         pad_token_num = self.n_channel + self.max_token_num - token_num
         if pad_token_num > 0:
             p = self.pad_token.repeat(b, pad_token_num, 1)
             emb_out = torch.cat((emb_out, p), dim=1)
-        
-        #print('emb_out shape is ',emb_out.shape) # [32, 24+17, 768] 
-        emb = self.gpt_out(emb_out)    
-        #print('emb_out emb is ',emb.shape) ## [32, 24+17, 768] > [32, 24+17, 64]  
+
+        #print('emb_out shape is ',emb_out.shape) # [32, 24+17, 768]
+        emb = self.gpt_out(emb_out)
+        #print('emb_out emb is ',emb.shape) ## [32, 24+17, 768] > [32, 24+17, 64]
         emb = self.gpt_out2(emb.permute(0,2,1)).permute(0,2,1)
-        #print('emb is ',emb.shape) ## [32, 24+17, 768] > [32, 24, 64]  
-        
+        #print('emb is ',emb.shape) ## [32, 24+17, 768] > [32, 24, 64]
 
-        
 
-        
+
+
+
         inp_enc = self.pos_enc(emb)
-        # print(' pos_enc inp_enc shape is ', inp_enc.shape) # [32, 24, 64]    
+        # print(' pos_enc inp_enc shape is ', inp_enc.shape) # [32, 24, 64]
         enc_cond = self.encoder(inp_enc, t, padding_masks=padding_masks)
        #  print(' enc_cond  is ', enc_cond.shape)  # [128, 24, 64]
         inp_dec = self.pos_dec(emb)
         #print(' pos_dec inp_enc shape is ', inp_dec.shape)   # [128, 24, 64]
-       
-        # (1) to do:  replace the encoder part refer to unitime and gpt4ts. no need to change decoder part because it's the key tech of Diffusion-TS 
+
+        # (1) to do:  replace the encoder part refer to unitime and gpt4ts. no need to change decoder part because it's the key tech of Diffusion-TS
         # add the prompt token to a new dim, (different from unitime add token to spatial dim),   return dim without token---self.inverse part
-        
+
         output, mean, trend, season = self.decoder(inp_dec, t, enc_cond, padding_masks=padding_masks)
        #  print(' decoder output shape is ', output.shape)  #  [128, 24, 64]
         #print(' decoder mean shape is ', mean.shape) # [128, 2, 7]
@@ -557,13 +590,13 @@ class Transformer(nn.Module):
         if return_res:
             return trend, self.combine_s(season.transpose(1, 2)).transpose(1, 2), res - res_m
 
-        
+
         # trend = trend * (stdev.repeat(1, trend.shape[1], 1))
         # trend = trend + (means.repeat(1, trend.shape[1], 1))
         # season_error = season_error * (stdev.repeat(1, season_error.shape[1], 1))
-        # season_error = season_error + (means.repeat(1, season_error.shape[1], 1))        
-        
-        
+        # season_error = season_error + (means.repeat(1, season_error.shape[1], 1))
+
+
         return trend, season_error
 
 

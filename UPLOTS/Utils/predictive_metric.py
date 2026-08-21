@@ -24,14 +24,14 @@ import numpy as np
 from sklearn.metrics import mean_absolute_error
 from Utils.metric_utils import extract_time
 
- 
+
 def predictive_score_metrics(ori_data, generated_data):
   """Report the performance of Post-hoc RNN one-step ahead prediction.
-  
+
   Args:
     - ori_data: original data
     - generated_data: generated synthetic data
-    
+
   Returns:
     - predictive_score: MAE of the predictions on the original data
   """
@@ -40,16 +40,16 @@ def predictive_score_metrics(ori_data, generated_data):
 
   # Basic Parameters
   no, seq_len, dim = ori_data.shape
-  
+
   # Set maximum sequence length and each sequence length
   ori_time, ori_max_seq_len = extract_time(ori_data)
-  generated_time, generated_max_seq_len = extract_time(ori_data)
-  max_seq_len = max([ori_max_seq_len, generated_max_seq_len]) 
-  # max_seq_len = 36 
-     
-  ## Builde a post-hoc RNN predictive network 
+  generated_time, generated_max_seq_len = extract_time(generated_data)
+  max_seq_len = max([ori_max_seq_len, generated_max_seq_len])
+  # max_seq_len = 36
+
+  ## Builde a post-hoc RNN predictive network
   # Network parameters
-  # int(dim/2) 
+  # int(dim/2)
   hidden_dim = 3
   iterations = 5000
   batch_size = 128
@@ -58,15 +58,15 @@ def predictive_score_metrics(ori_data, generated_data):
   X = tf1.placeholder(tf.float32, [None, max_seq_len-1, dim-1], name = "myinput_x")
   T = tf1.placeholder(tf.int32, [None], name = "myinput_t")
   Y = tf1.placeholder(tf.float32, [None, max_seq_len-1, 1], name = "myinput_y")
-    
+
   # Predictor function
   def predictor (x, t):
     """Simple predictor function.
-    
+
     Args:
       - x: time-series data
       - t: time information
-      
+
     Returns:
       - y_hat: prediction
       - p_vars: predictor variables
@@ -78,59 +78,59 @@ def predictive_score_metrics(ori_data, generated_data):
       y_hat_logit = tf1.layers.dense(p_outputs, 1, activation=None)
       y_hat = tf.nn.sigmoid(y_hat_logit)
       p_vars = [v for v in tf1.all_variables() if v.name.startswith(vs.name)]
-    
+
     return y_hat, p_vars
-    
+
   y_pred, p_vars = predictor(X, T)
   # Loss for the predictor
   p_loss = tf1.losses.absolute_difference(Y, y_pred)
   # optimizer
   p_solver = tf1.train.AdamOptimizer().minimize(p_loss, var_list = p_vars)
-        
-  ## Training    
+
+  ## Training
   # Session start
   sess = tf1.Session()
   sess.run(tf1.global_variables_initializer())
 
   from tqdm.auto import tqdm
-    
+
   # Training using Synthetic dataset
   for itt in tqdm(range(iterations), desc='training', total=iterations):
-          
+
     # Set mini-batch
     idx = np.random.permutation(len(generated_data))
-    train_idx = idx[:batch_size]     
-            
+    train_idx = idx[:batch_size]
+
     X_mb = list(generated_data[i][:-1,:(dim-1)] for i in train_idx)
     T_mb = list(generated_time[i]-1 for i in train_idx)
-    Y_mb = list(np.reshape(generated_data[i][1:,(dim-1)],[len(generated_data[i][1:,(dim-1)]),1]) for i in train_idx)        
-          
+    Y_mb = list(np.reshape(generated_data[i][1:,(dim-1)],[len(generated_data[i][1:,(dim-1)]),1]) for i in train_idx)
+
     # Train predictor
     _, step_p_loss = sess.run([p_solver, p_loss], feed_dict={X: X_mb, T: T_mb, Y: Y_mb})
-    
+
   ## Test the trained model on the original data
   idx = np.random.permutation(len(ori_data))
   train_idx = idx[:no]
 
   # idx = np.random.permutation(len(generated_data))
-  # train_idx = idx[:batch_size]       
+  # train_idx = idx[:batch_size]
   # X_mb = list(generated_data[i][:-1,:(dim-1)] for i in train_idx)
   # T_mb = list(generated_time[i]-1 for i in train_idx)
-  # Y_mb = list(np.reshape(generated_data[i][1:,(dim-1)],[len(generated_data[i][1:,(dim-1)]),1]) for i in train_idx) 
-  
+  # Y_mb = list(np.reshape(generated_data[i][1:,(dim-1)],[len(generated_data[i][1:,(dim-1)]),1]) for i in train_idx)
+
   X_mb = list(ori_data[i][:-1,:(dim-1)] for i in train_idx)
   T_mb = list(ori_time[i]-1 for i in train_idx)
   Y_mb = list(np.reshape(ori_data[i][1:,(dim-1)], [len(ori_data[i][1:,(dim-1)]),1]) for i in train_idx)
-    
+
   # Prediction
   pred_Y_curr = sess.run(y_pred, feed_dict={X: X_mb, T: T_mb})
-    
+
   # Compute the performance in terms of MAE
   MAE_temp = 0
   for i in range(no):
     MAE_temp = MAE_temp + mean_absolute_error(Y_mb[i], pred_Y_curr[i,:,:])
-    
+
   predictive_score = MAE_temp / no
-    
+
   return predictive_score
-    
+

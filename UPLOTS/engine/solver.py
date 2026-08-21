@@ -1,6 +1,7 @@
 import os
 import sys
 import time
+import math
 import torch
 import numpy as np
 import random
@@ -11,7 +12,6 @@ from torch.optim import Adam
 from torch.nn.utils import clip_grad_norm_
 from Utils.io_utils import instantiate_from_config, get_model_parameters_info
 from collections import deque
-import numpy as np
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '../'))
 
@@ -32,15 +32,21 @@ class Trainer(object):
         self.save_cycle = config['solver']['save_cycle']
 #         self.dl = cycle(dataloader['dataloader'])
 
-        self.ins = ins 
+        self.ins = ins
         self.train_loaders = dataloader
         self.train_batches = train_batches
         self.max_train_batches=max_train_batches
         # print('train_batches is ',train_batches)
         self.step = 0
         self.milestone = 0
+        self.current_epoch = 0
         self.args = args
         self.logger = logger
+
+        self.loader_batch_counts = [len(dl) for dl in self.train_loaders]
+        self.loss_window = int(args.loss_window)
+        self.loss_histories = [deque(maxlen=self.loss_window) for _ in self.train_loaders]
+        self.calm_fixed_weights = None
 
         self.results_folder = Path('Checkpoints_'+ args.name + f'_{model.seq_length}'+ f'_maskrate{args.mask_rate}')
         os.makedirs(self.results_folder, exist_ok=True)
@@ -60,165 +66,269 @@ class Trainer(object):
             self.logger.log_info(str(get_model_parameters_info(self.model)))
         self.log_frequency = 100
 
-    def save(self, milestone, verbose=False):
+    def save(self, milestone, epoch=None, verbose=False):
         if self.logger is not None and verbose:
             self.logger.log_info('Save current model to {}'.format(str(self.results_folder / f'checkpoint-{milestone}.pt')))
         data = {
             'step': self.step,
+            'epoch': epoch if epoch is not None else getattr(self, 'current_epoch', 0),
             'model': self.model.state_dict(),
             'ema': self.ema.state_dict(),
             'opt': self.opt.state_dict(),
+            'loss_histories': [list(history) for history in self.loss_histories],
+            'calm_fixed_weights': self.calm_fixed_weights,
         }
         torch.save(data, str(self.results_folder / f'checkpoint-{milestone}.pt'))
 
     def load(self, milestone, verbose=False):
+        ckpt_path = self.results_folder / f'checkpoint-{milestone}.pt'
+        # 如果文件不存在，给出提示并跳过加载，返回当前 epoch（默认为 0）
+        if not ckpt_path.exists():
+            if self.logger is not None:
+                self.logger.log_info(f'Checkpoint file not found: {ckpt_path}, skip loading.')
+            return getattr(self, 'current_epoch', 0)
+
         if self.logger is not None and verbose:
-            self.logger.log_info('Resume from {}'.format(str(self.results_folder / f'checkpoint-{milestone}.pt')))
+            self.logger.log_info('Resume from {}'.format(str(ckpt_path)))
         device = self.device
-        data = torch.load(str(self.results_folder / f'checkpoint-{milestone}.pt'), map_location=device)
+        data = torch.load(str(ckpt_path), map_location=device)
         self.model.load_state_dict(data['model'])
         self.step = data['step']
         self.opt.load_state_dict(data['opt'])
         self.ema.load_state_dict(data['ema'])
+        saved_histories = data.get('loss_histories')
+        if saved_histories is not None and len(saved_histories) == len(self.loss_histories):
+            self.loss_histories = [
+                deque(history, maxlen=self.loss_window) for history in saved_histories
+            ]
+        self.calm_fixed_weights = data.get('calm_fixed_weights')
         self.milestone = milestone
+        # 恢复 epoch 信息
+        self.current_epoch = data.get('epoch', milestone)
+        return self.current_epoch
+
+    def find_latest_checkpoint(self):
+        """查找最新的 checkpoint，返回 milestone 和 epoch"""
+        if not self.results_folder.exists():
+            return None, 0
+
+        checkpoints = list(self.results_folder.glob('checkpoint-*.pt'))
+        if not checkpoints:
+            return None, 0
+
+        # 提取 milestone 并排序
+        milestones = []
+        for cp in checkpoints:
+            try:
+                milestone = int(cp.stem.split('-')[1])
+                milestones.append((milestone, cp))
+            except:
+                continue
+
+        if not milestones:
+            return None, 0
+
+        # 找到最大的 milestone
+        latest_milestone, latest_cp = max(milestones, key=lambda x: x[0])
+
+        # 读取 epoch 信息
+        try:
+            data = torch.load(str(latest_cp), map_location='cpu')
+            epoch = data.get('epoch', latest_milestone)
+            return latest_milestone, epoch
+        except:
+            return latest_milestone, latest_milestone
 
 
 
-    def train(self,milestone):
+    def _rolling_losses(self):
+        return np.asarray([
+            float(np.mean(history)) if history else 1.0
+            for history in self.loss_histories
+        ], dtype=np.float64)
+
+    def _calm_weights(self):
+        """Map higher rolling losses to smaller curriculum weights in [s, 1]."""
+        num_datasets = len(self.train_loaders)
+        if self.args.disable_calm or num_datasets == 1:
+            return {idx: 1.0 for idx in range(num_datasets)}
+
+        rolling = self._rolling_losses()
+        loss_max, loss_min = float(rolling.max()), float(rolling.min())
+        if not np.isfinite(loss_max - loss_min) or loss_max - loss_min <= 1e-12:
+            return {idx: 1.0 for idx in range(num_datasets)}
+
+        min_weight = float(self.args.calm_min_weight)
+        weights = min_weight + (loss_max - rolling) / (loss_max - loss_min) * (1.0 - min_weight)
+        return {idx: float(weight) for idx, weight in enumerate(weights)}
+
+    def _rlds_probabilities(self):
+        """Return loss-proportional dataset probabilities for the next micro-batch."""
+        num_datasets = len(self.train_loaders)
+        if self.args.disable_rlds or num_datasets == 1:
+            return np.full(num_datasets, 1.0 / num_datasets, dtype=np.float64)
+
+        rolling = np.clip(self._rolling_losses(), 1e-12, None)
+        temperature = float(self.args.rlds_temperature)
+        scaled = np.power(rolling, 1.0 / temperature)
+        if not np.all(np.isfinite(scaled)) or scaled.sum() <= 0:
+            return np.full(num_datasets, 1.0 / num_datasets, dtype=np.float64)
+        return scaled / scaled.sum()
+
+    @staticmethod
+    def _next_cycled_batch(loader, iterator):
+        """Draw a batch and restart an exhausted loader so RLDS can truly resample it."""
+        try:
+            return next(iterator), iterator
+        except StopIteration:
+            iterator = iter(loader)
+            try:
+                return next(iterator), iterator
+            except StopIteration as exc:
+                raise RuntimeError('Encountered an empty training dataloader.') from exc
+
+    def train(self, start_epoch=None):
         device = self.device
-        step = 0
         if self.logger is not None:
             tic = time.time()
             self.logger.log_info('{}: start training...'.format(self.args.name), check_primary=False)
 
-        import math
         weak_dataset_idx = self.args.weak_idx
         alpha = self.args.alpha
-        
-        # weight_by_idx = {
-        #     0: 0.93, 1: 0.95, 2: 0.94, 3: 0.97,
-        #     4: 1.00, 5: 0.91, 7: 0.92,
-        # }
+
+        # 确定起始 epoch
+        if start_epoch is None:
+            start_epoch = getattr(self, 'current_epoch', 0)
+
+        # 确保训练到指定的 epoch 数
+        target_epoch = self.args.epoch
+        if start_epoch >= target_epoch:
+            if self.logger is not None:
+                self.logger.log_info(f'Already reached target epoch {target_epoch}, current epoch: {start_epoch}')
+            return
+
+        if self.logger is not None:
+            self.logger.log_info(f'Resuming training from epoch {start_epoch} to {target_epoch}')
 
         num_datasets = len(self.train_loaders)
-        window_size = 100
-        loss_histories = [deque(maxlen=window_size) for _ in range(num_datasets)]
         steps_per_epoch = math.ceil(self.train_batches / self.gradient_accumulate_every)
-        total_steps      = steps_per_epoch * self.args.epoch
-        with tqdm(initial=step, total=total_steps) as pbar:
-            for e in range(milestone, self.args.epoch):
+        total_steps = steps_per_epoch * (target_epoch - start_epoch)
+        with tqdm(total=total_steps) as pbar:
+            for e in range(start_epoch, target_epoch):
+                self.current_epoch = e
 
                 print('##############')
                 print('Current Epoch ', e)
                 print('##############')
-                # —— 仅在前两个 epoch 计算 weight_by_idx —— #
-                if e < 2:
-                    avg_losses = [(np.mean(h) if len(h)>0 else 1.0) for h in loss_histories]
-                    max_l, min_l = max(avg_losses), min(avg_losses)
-                    if max_l > min_l:
-                        weight_by_idx = {
-                            i: 0.9 + (max_l - l) / (max_l - min_l) * (0.97 - 0.9)
-                            for i, l in enumerate(avg_losses)
-                        }
-                    else:
-                        weight_by_idx = { i: 0.97 for i in range(num_datasets) }
-                    # 在 e==1 时把第一轮和第二轮的计算结果固定下来
-                    if e == 1:
-                        fixed_weights = weight_by_idx.copy()
+                if e < self.args.calm_warmup_epochs:
+                    weight_by_idx = self._calm_weights()
                 else:
-                    # 后续 epoch 直接复用
-                    weight_by_idx = fixed_weights
+                    if self.calm_fixed_weights is None:
+                        self.calm_fixed_weights = self._calm_weights()
+                    weight_by_idx = self.calm_fixed_weights
+                if self.args.disable_calm or e >= self.args.calm_active_epochs:
+                    weight_by_idx = {idx: 1.0 for idx in range(num_datasets)}
 
-                # 每个 epoch 重置迭代器和标记
-                iterators = [dl._get_iterator() for dl in self.train_loaders]
-                finished  = [False] * num_datasets
+                iterators = [iter(loader) for loader in self.train_loaders]
                 batch_cnt = [0] * num_datasets
+                micro_batches_done = 0
 
-                # 直到所有 mini-batch 都被处理
-                while sum(batch_cnt) < self.train_batches:
-                    # —— 动态采样概率 —— #
-                    avg_losses = [(np.mean(h) if len(h)>0 else 1.0) for h in loss_histories]
-                    probs = np.array(avg_losses)
-                    probs = probs / probs.sum()
-                    alive = [i for i, f in enumerate(finished) if not f]
-                    alive_probs = probs[alive] / probs[alive].sum()
-                    idx = np.random.choice(alive, p=alive_probs)
+                # Without RLDS, preserve the original per-loader batch counts exactly.
+                static_schedule = None
+                if self.args.disable_rlds:
+                    static_schedule = [
+                        idx
+                        for idx, count in enumerate(self.loader_batch_counts)
+                        for _ in range(count)
+                    ]
+                    epoch_rng = np.random.RandomState(self.args.seed + e)
+                    epoch_rng.shuffle(static_schedule)
 
-                    # idx = random.randint(0, length - 1)  
-                    instruct = self.ins[idx]
+                while micro_batches_done < self.train_batches:
+                    accumulate_now = min(
+                        self.gradient_accumulate_every,
+                        self.train_batches - micro_batches_done,
+                    )
+                    raw_loss_sum = 0.0
+                    weighted_loss_sum = 0.0
+                    self.opt.zero_grad()
 
-                    # —— pick weight: only apply during the first 20 epochs —— #
-                    if e < 50:
+                    for _ in range(accumulate_now):
+                        if static_schedule is None:
+                            probs = self._rlds_probabilities()
+                            idx = int(np.random.choice(num_datasets, p=probs))
+                        else:
+                            idx = static_schedule[micro_batches_done]
 
-                        w = weight_by_idx.get(idx, 1.0)
-                    else:
-                        w = 1.0
+                        data, iterators[idx] = self._next_cycled_batch(
+                            self.train_loaders[idx], iterators[idx]
+                        )
+                        data = data.to(device, non_blocking=True)
 
-                    # 累积梯度
-                    got_any = False
-                    total_loss = 0.0
-                    for _ in range(self.gradient_accumulate_every):
-                        try:
-                            data = next(iterators[idx]).to(device)
-                            # —— 你的数据预处理逻辑 —— #
-                            b, t, n = data.shape
-                            data = data.permute(0, 2, 1).reshape(b*n, t, 1)
-                            mask = torch.rand((b*n, t, 1), device=device)
-                            mask[mask < self.args.mask_rate] = 0
-                            mask[mask >= self.args.mask_rate] = 1
-                            model_input = data.masked_fill(mask == 0, 0)
+                        # Shared channel-independent model: each variable becomes one sequence.
+                        b, t, n = data.shape
+                        data = data.permute(0, 2, 1).reshape(b * n, t, 1)
+                        mask = (torch.rand((b * n, t, 1), device=device) >= self.args.mask_rate).float()
+                        model_input = data.masked_fill(mask == 0, 0)
 
-                            # —— 前向计算 + 弱势数据集加权 —— #
-                            loss = self.model(instruct, model_input, mask=mask, target=model_input)
-                            if idx == weak_dataset_idx:
-                                loss = loss * alpha
+                        raw_loss = self.model(
+                            self.ins[idx], model_input, mask=mask, target=model_input
+                        )
+                        raw_value = float(raw_loss.detach().item())
+                        self.loss_histories[idx].append(raw_value)
 
-                            loss = loss / self.gradient_accumulate_every
-                            loss.backward()
+                        curriculum_weight = weight_by_idx.get(idx, 1.0)
+                        manual_weight = alpha if idx == weak_dataset_idx else 1.0
+                        weighted_loss = raw_loss * curriculum_weight * manual_weight
+                        (weighted_loss / accumulate_now).backward()
 
-                            total_loss += loss.item()
-                            batch_cnt[idx] += 1
-                            got_any = True
-                        except StopIteration:
-                            finished[idx] = True
-                            break
+                        raw_loss_sum += raw_value
+                        weighted_loss_sum += float(weighted_loss.detach().item())
+                        batch_cnt[idx] += 1
+                        micro_batches_done += 1
 
-                    if not got_any:
-                        continue
-
-                    # —— 更新参数 —— #
                     clip_grad_norm_(self.model.parameters(), 1.0)
                     self.opt.step()
-                    self.sch.step(total_loss)
-                    self.opt.zero_grad()
+                    scheduler_loss = weighted_loss_sum / accumulate_now
+                    self.sch.step(scheduler_loss)
                     self.step += 1
-                    step += 1
                     self.ema.update()
 
-                    # —— 更新 loss history —— #
-                    loss_histories[idx].append(total_loss)
-
-                    # —— 日志 & checkpoint —— #
                     if self.logger is not None and self.step % self.log_frequency == 0:
-                        # info = '{}: train'.format(self.args.name)
-                        # info = info + ': Epoch {}/{}'.format(self.step, self.train_num_steps)
-                        # info += ' ||'
-                        # info += '' if loss_f == 'none' else ' Fourier Loss: {:.4f}'.format(loss_f.item())
-                        # info += '' if loss_r == 'none' else ' Reglarization: {:.4f}'.format(loss_r.item())
-                        # info += ' | Total Loss: {:.6f}'.format(total_loss)
-                        # self.logger.log_info(info)
-                        self.logger.add_scalar(tag='train/loss', scalar_value=total_loss, global_step=self.step)
+                        self.logger.add_scalar(
+                            tag='train/raw_loss',
+                            scalar_value=raw_loss_sum / accumulate_now,
+                            global_step=self.step,
+                        )
+                        self.logger.add_scalar(
+                            tag='train/weighted_loss',
+                            scalar_value=scheduler_loss,
+                            global_step=self.step,
+                        )
 
                     pbar.update(1)
-                    pbar.set_description(f'Step: {step}, Loss: {total_loss:.6f}')
+                    pbar.set_description(
+                        f'Step: {self.step}, Raw: {raw_loss_sum / accumulate_now:.6f}, '
+                        f'Weighted: {scheduler_loss:.6f}'
+                    )
 
-                    if sum(batch_cnt) >= self.train_batches:
-                        with torch.no_grad():
-                            self.milestone += 1
-                            if self.milestone % 1 == 0:
-                                self.save(self.milestone)
-                        break
-                        
+                if e + 1 == self.args.calm_warmup_epochs:
+                    self.calm_fixed_weights = self._calm_weights()
+
+                if self.logger is not None:
+                    self.logger.log_info(
+                        'Epoch {} sampling counts: {}; CALM weights: {}'.format(
+                            e + 1,
+                            batch_cnt,
+                            [round(weight_by_idx[idx], 6) for idx in range(num_datasets)],
+                        ),
+                        check_primary=False,
+                    )
+
+                self.milestone = e + 1
+                if ((e + 1) % self.args.checkpoint_every == 0) or (e + 1 == target_epoch):
+                    with torch.no_grad():
+                        self.save(self.milestone, epoch=e + 1)
 
         print('training complete')
         if self.logger is not None:
@@ -228,14 +338,18 @@ class Trainer(object):
         if self.logger is not None:
             tic = time.time()
             self.logger.log_info('Begin to sample...')
-        samples = np.empty([0, shape[0], shape[1]])
-        num_cycle = int(num // size_every) + 1
-
-        for _ in range(num_cycle):
-            sample = self.ema.ema_model.generate_mts(instruct, batch_size=size_every)
-            # print('sample shape is : ',sample.shape)
-            samples = np.row_stack([samples, sample.detach().cpu().numpy()])
+        sample_chunks = []
+        generated = 0
+        while generated < num:
+            current_batch = min(size_every, num - generated)
+            sample = self.ema.ema_model.generate_mts(instruct, batch_size=current_batch)
+            sample_chunks.append(sample.detach().cpu().numpy())
+            generated += current_batch
             torch.cuda.empty_cache()
+
+        samples = np.concatenate(sample_chunks, axis=0) if sample_chunks else np.empty(
+            [0, shape[0], shape[1]]
+        )
 
         if self.logger is not None:
             self.logger.log_info('Sampling done, time: {:.2f}'.format(time.time() - tic))
@@ -264,7 +378,7 @@ class Trainer(object):
             samples = np.row_stack([samples, sample.detach().cpu().numpy()])
             reals = np.row_stack([reals, x.detach().cpu().numpy()])
             masks = np.row_stack([masks, t_m.detach().cpu().numpy()])
-        
+
         if self.logger is not None:
             self.logger.log_info('Imputation done, time: {:.2f}'.format(time.time() - tic))
         return samples, reals, masks

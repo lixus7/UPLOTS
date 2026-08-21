@@ -1,0 +1,28 @@
+# Python-generated files
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Local environments and credentials
+.env
+.venv/
+venv/
+.huggingface/
+
+# Training outputs and checkpoints
+OUTPUT/
+Checkpoints_*/
+*.pt
+*.pth
+*.ckpt
+*.log
+*.out
+*.err
+runs/
+wandb/
+
+# Editor and notebook state
+.DS_Store
+.idea/
+.vscode/
+.ipynb_checkpoints/

@@ -1,4 +1,6 @@
 import os
+from pathlib import Path
+
 import torch
 import numpy as np
 import pandas as pd
@@ -12,20 +14,20 @@ from Utils.masking_utils import noise_mask
 
 class CustomDataset(Dataset):
     def __init__(
-        self, 
+        self,
         name,
-        data_root, 
-        window=64, 
-        proportion=0.8, 
-        save2npy=True, 
+        data_root,
+        window=64,
+        proportion=0.8,
+        save2npy=True,
         neg_one_to_one=True,
         seed=123,
         period='train',
         output_dir='./OUTPUT',
         predict_length=None,
         missing_ratio=None,
-        style='separate', 
-        distribution='geometric', 
+        style='separate',
+        distribution='geometric',
         mean_mask_length=3
     ):
         super(CustomDataset, self).__init__()
@@ -35,7 +37,7 @@ class CustomDataset(Dataset):
         self.name, self.pred_len, self.missing_ratio = name, predict_length, missing_ratio
         self.style, self.distribution, self.mean_mask_length = style, distribution, mean_mask_length
         self.rawdata, self.scaler = self.read_data(data_root, self.name)
-        self.savedataname = data_root.replace('./Data/datasets/', '').replace('.csv', '')
+        self.savedataname = Path(data_root).stem
         # print('data_root  ', data_root)
         print('self.savedataname  ', self.savedataname)
         print('print(self.scaler.scale_) ',self.scaler.scale_)
@@ -48,7 +50,7 @@ class CustomDataset(Dataset):
         self.sample_num_total = max(self.len - self.window + 1, 0)
         self.save2npy = save2npy
         self.auto_norm = neg_one_to_one
-        
+
         self.data = self.__normalize(self.rawdata)
         train, inference = self.__getsamples(self.data, proportion, seed)
 
@@ -101,7 +103,7 @@ class CustomDataset(Dataset):
     def unnormalize(self, sq):
         d = self.__unnormalize(sq.reshape(-1, self.var_num))
         return d.reshape(-1, self.window, self.var_num)
-    
+
     def __normalize(self, rawdata):
         print('input is ',rawdata.shape)
         data = self.scaler.transform(rawdata)
@@ -114,7 +116,7 @@ class CustomDataset(Dataset):
             data = unnormalize_to_zero_to_one(data)
         x = data
         return self.scaler.inverse_transform(x)
-    
+
     @staticmethod
     def divide(data, ratio, seed=2023):
         size = data.shape[0]
@@ -137,16 +139,29 @@ class CustomDataset(Dataset):
 
     @staticmethod
     def read_data(filepath, name=''):
-        """Reads a single .csv
-        """
-        df = pd.read_csv(filepath, header=0)
-        if name == 'etth':
-            df.drop(df.columns[0], axis=1, inplace=True)
-        data = df.values
+        """Read a numeric CSV or a PEMS-style NPZ array."""
+        suffix = Path(filepath).suffix.lower()
+        if suffix == '.npz':
+            with np.load(filepath) as archive:
+                if 'data' not in archive:
+                    raise KeyError(f"NPZ dataset {filepath!r} does not contain a 'data' array.")
+                data = np.asarray(archive['data'])
+            if data.ndim == 3:
+                data = data[:, :, 0]
+            elif data.ndim != 2:
+                raise ValueError(
+                    f'Expected a 2D or 3D array in {filepath!r}, got shape {data.shape}.'
+                )
+        else:
+            frame = pd.read_csv(filepath, header=0)
+            if name == 'etth':
+                frame.drop(frame.columns[0], axis=1, inplace=True)
+            data = frame.values
+
         scaler = MinMaxScaler()
         scaler = scaler.fit(data)
         return data, scaler
-    
+
     def mask_data(self, seed=2023):
         masks = np.ones_like(self.samples)
         # Store the state of the RNG to restore later.
@@ -177,12 +192,12 @@ class CustomDataset(Dataset):
 
     def __len__(self):
         return self.sample_num
-    
+
 
 class fMRIDataset(CustomDataset):
     def __init__(
-        self, 
-        proportion=1., 
+        self,
+        proportion=1.,
         **kwargs
     ):
         super().__init__(proportion=proportion, **kwargs)
